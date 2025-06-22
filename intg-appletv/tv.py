@@ -983,18 +983,12 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
     @async_handle_atvlib_errors
     async def toggle_guide(self) -> ucapi.StatusCodes:
         """Toggle the EPG."""
-        if self._is_feature_available(FeatureName.Guide):
-            companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
-            if companion:
-                await companion._press_button(HidCommand.Guide)
+        await self._send_companion_hid(HidCommand.Guide)
 
     @async_handle_atvlib_errors
     async def control_center(self) -> ucapi.StatusCodes:
         """Open the Control Center.."""
-        if self._is_feature_available(FeatureName.ControlCenter):
-            companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
-            if companion:
-                await companion._press_button(HidCommand.PageDown)
+        await self._send_companion_hid(HidCommand.PageDown)
 
     @async_handle_atvlib_errors
     async def set_output_device(self, device_name: str) -> ucapi.StatusCodes:
@@ -1057,3 +1051,9 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
             await self._atv.remote_control.main_instance.protocol.send(messages.send_hid_event(use_page, usage, False))
         else:
             _LOG.warning("[%s] send HID key not supported (%d, %d)", self.log_id, use_page, usage)
+
+    async def _send_companion_hid(self, hid_command: HidCommand):
+        companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
+        if companion:
+            # pylint: disable=W0212
+            await companion._press_button(hid_command)
