@@ -47,7 +47,7 @@ from pyatv.const import (
 from pyatv.core.facade import FacadeAudio, FacadeRemoteControl, FacadeTouchGestures
 from pyatv.core.protocol import DispatchMessage
 from pyatv.interface import BaseConfig, OutputDevice
-from pyatv.protocols.companion import CompanionAPI, MediaControlCommand, SystemStatus
+from pyatv.protocols.companion import CompanionAPI, HidCommand, MediaControlCommand, SystemStatus
 from pyatv.protocols.mrp import (
     MrpAudio,
     MrpRemoteControl,
@@ -984,13 +984,17 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
     async def toggle_guide(self) -> ucapi.StatusCodes:
         """Toggle the EPG."""
         if self._is_feature_available(FeatureName.Guide):
-            await self._atv.remote_control.guide()
+            companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
+            if companion:
+                await companion._press_button(HidCommand.Guide)
 
     @async_handle_atvlib_errors
     async def control_center(self) -> ucapi.StatusCodes:
         """Open the Control Center.."""
         if self._is_feature_available(FeatureName.ControlCenter):
-            await self._atv.remote_control.control_center()
+            companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
+            if companion:
+                await companion._press_button(HidCommand.PageDown)
 
     @async_handle_atvlib_errors
     async def set_output_device(self, device_name: str) -> ucapi.StatusCodes:
