@@ -289,7 +289,7 @@ async def media_player_cmd_handler(
         case media_player.Commands.SELECT_SOURCE:
             res = await device.launch_app(params["source"])
         case media_player.Commands.GUIDE:
-            res = await device.send_hid_key(UsagePage.CONSUMER, HidCommand.Guide)
+            res = await device.toggle_guide()
             # res = await device.toggle_guide()
         # --- simple commands ---
         case SimpleCommands.TOP_MENU:
