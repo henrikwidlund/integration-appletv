@@ -14,8 +14,6 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
-from pyatv.protocols.companion import HidCommand
-
 import config
 import pyatv
 
@@ -31,6 +29,7 @@ import ucapi
 import ucapi.api as uc
 from hid import UsagePage
 from hid.consumer_control_code import ConsumerControlCode
+from pyatv.protocols.companion import HidCommand
 from ucapi import MediaPlayer, media_player
 
 _LOG = logging.getLogger("driver")  # avoid having __main__ in log messages

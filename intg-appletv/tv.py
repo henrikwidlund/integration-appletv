@@ -47,7 +47,12 @@ from pyatv.const import (
 from pyatv.core.facade import FacadeAudio, FacadeRemoteControl, FacadeTouchGestures
 from pyatv.core.protocol import DispatchMessage
 from pyatv.interface import BaseConfig, OutputDevice
-from pyatv.protocols.companion import CompanionAPI, HidCommand, MediaControlCommand, SystemStatus
+from pyatv.protocols.companion import (
+    CompanionAPI,
+    HidCommand,
+    MediaControlCommand,
+    SystemStatus,
+)
 from pyatv.protocols.mrp import (
     MrpAudio,
     MrpRemoteControl,
