@@ -1,8 +1,8 @@
 {
-	"driver_id": "appletv",
+	"driver_id": "appletv2",
 	"version": "0.19.0",
 	"min_core_api": "0.7.1",
-	"name": { "en": "Apple TV" },
+	"name": { "en": "Apple TV2" },
 	"icon": "uc:integration",
 	"description": {
 		"_comment": "set at runtime"

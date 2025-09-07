@@ -88,6 +88,14 @@ class Devices:
         """
         self._data_path: str = data_path
         self._cfg_file_path: str = os.path.join(data_path, _CFG_FILENAME)
+        # create _cfg_file_path if it does not exist
+        if not os.path.exists(self._cfg_file_path):
+            try:
+                os.makedirs(data_path, exist_ok=True)
+                with open(self._cfg_file_path, "w+", encoding="utf-8") as f:
+                    f.write("")
+            except OSError as err:
+                _LOG.error("Cannot create the config file: %s", err)
         self._config: list[AtvDevice] = []
         self._add_handler = add_handler
         self._remove_handler = remove_handler
