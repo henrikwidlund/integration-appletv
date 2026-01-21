@@ -1035,7 +1035,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
     @async_handle_atvlib_errors
     async def control_center(self) -> ucapi.StatusCodes:
         """Show control center: press and hold home key for one second."""
-        await self._atv.remote_control.home(InputAction.Hold)
+        await self._atv.remote_control.control_center()
 
     @async_handle_atvlib_errors
     async def menu(self) -> ucapi.StatusCodes:
@@ -1093,10 +1093,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
     @async_handle_atvlib_errors
     async def toggle_guide(self) -> ucapi.StatusCodes:
         """Toggle the EPG."""
-        companion = cast(FacadeRemoteControl, self._atv.remote_control).get(Protocol.Companion)
-        if companion:
-            # pylint: disable=W0212
-            await companion._press_button(HidCommand.Guide)
+        await self._atv.remote_control.guide()
 
     @async_handle_atvlib_errors
     async def set_output_device(self, device_name: str) -> ucapi.StatusCodes:
