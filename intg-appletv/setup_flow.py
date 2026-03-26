@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import socket
+from collections import deque
 from enum import IntEnum
 
 import config
@@ -40,17 +41,35 @@ class SetupSteps(IntEnum):
     CONFIGURATION_MODE = 1
     DISCOVER = 2
     DEVICE_CHOICE = 3
-    PAIRING_AIRPLAY = 4
-    PAIRING_COMPANION = 5
-    RECONFIGURE = 6
+    PAIRING_MRP = 4
+    PAIRING_AIRPLAY = 5
+    PAIRING_COMPANION = 6
+    PAIRING_RAOP = 7
+    RECONFIGURE = 8
 
 
-_setup_step = SetupSteps.INIT
-_cfg_add_device: bool = False
-_manual_address: bool = False
-_discovered_atvs: list[pyatv.interface.BaseConfig] | None = None
-_pairing_apple_tv: tv.AppleTv | None = None
-_reconfigured_device: AtvDevice | None = None
+SETUP_STEP = SetupSteps.INIT
+cfg_add_device: bool = False
+manual_address: bool = False
+DISCOVERED_ATVS: list[pyatv.interface.BaseConfig] | None = None
+pairing_apple_tv: tv.AppleTv | None = None
+RECONFIGURED_DEVICE: AtvDevice | None = None
+supported_protocols: deque[pyatv.const.Protocol] | None = None
+current_protocol: pyatv.const.Protocol | None = None
+
+MAP_PROTOCOL_TO_SETUP_STEP = {
+    pyatv.const.Protocol.MRP: SetupSteps.PAIRING_MRP,
+    pyatv.const.Protocol.AirPlay: SetupSteps.PAIRING_AIRPLAY,
+    pyatv.const.Protocol.Companion: SetupSteps.PAIRING_COMPANION,
+    pyatv.const.Protocol.RAOP: SetupSteps.PAIRING_RAOP,
+}
+
+MAP_PROTOCOL_TO_ATV_PROTOCOL = {
+    pyatv.const.Protocol.MRP: AtvProtocol.MRP,
+    pyatv.const.Protocol.AirPlay: AtvProtocol.AIRPLAY,
+    pyatv.const.Protocol.Companion: AtvProtocol.COMPANION,
+    pyatv.const.Protocol.RAOP: AtvProtocol.RAOP,
+}
 
 
 def setup_data_schema():
@@ -98,36 +117,38 @@ async def driver_setup_handler(msg: SetupDriver) -> SetupAction:  # pylint: disa
     :param msg: the setup driver request object, either DriverSetupRequest or UserDataResponse
     :return: the setup action on how to continue
     """
-    global _setup_step
-    global _cfg_add_device
-    global _pairing_apple_tv
+    global SETUP_STEP
+    global cfg_add_device
+    global pairing_apple_tv
 
     if isinstance(msg, DriverSetupRequest):
-        _setup_step = SetupSteps.INIT
-        _cfg_add_device = False
+        SETUP_STEP = SetupSteps.INIT
+        cfg_add_device = False
         return await _handle_driver_setup(msg)
 
     if isinstance(msg, UserDataResponse):
         _LOG.debug("%s", msg)
-        if _setup_step == SetupSteps.CONFIGURATION_MODE and "action" in msg.input_values:
+        if SETUP_STEP == SetupSteps.CONFIGURATION_MODE and "action" in msg.input_values:
             return await _handle_configuration_mode(msg)
-        if _setup_step == SetupSteps.DISCOVER and "address" in msg.input_values:
+        if SETUP_STEP == SetupSteps.DISCOVER and "address" in msg.input_values:
             return await _handle_discovery(msg)
-        if _setup_step == SetupSteps.DEVICE_CHOICE and "choice" in msg.input_values:
+        if SETUP_STEP == SetupSteps.DEVICE_CHOICE and "choice" in msg.input_values:
             return await _handle_device_choice(msg)
-        if _setup_step == SetupSteps.PAIRING_AIRPLAY and "pin_airplay" in msg.input_values:
-            return await _handle_user_data_airplay_pin(msg)
-        if _setup_step == SetupSteps.PAIRING_COMPANION and "pin_companion" in msg.input_values:
-            return await _handle_user_data_companion_pin(msg)
-        if _setup_step == SetupSteps.RECONFIGURE:
+        if (
+            SETUP_STEP in MAP_PROTOCOL_TO_SETUP_STEP.values()
+            and current_protocol is not None
+            and f"pin_{current_protocol.name.lower()}" in msg.input_values
+        ):
+            return await _handle_user_data_pin(msg)
+        if SETUP_STEP == SetupSteps.RECONFIGURE:
             return await _handle_device_reconfigure(msg)
         _LOG.error("No or invalid user response was received: %s", msg)
     elif isinstance(msg, AbortDriverSetup):
         _LOG.info("Setup was aborted with code: %s", msg.error)
-        if _pairing_apple_tv is not None:
-            await _pairing_apple_tv.disconnect()
-            _pairing_apple_tv = None
-        _setup_step = SetupSteps.INIT
+        if pairing_apple_tv is not None:
+            await pairing_apple_tv.disconnect()
+            pairing_apple_tv = None
+        SETUP_STEP = SetupSteps.INIT
 
     # user confirmation not used in setup process
     # if isinstance(msg, UserConfirmationResponse):
@@ -149,13 +170,13 @@ async def _handle_driver_setup(msg: DriverSetupRequest) -> RequestUserInput | Se
     :param msg: driver setup request data, only `reconfigure` flag is of interest.
     :return: the setup action on how to continue
     """
-    global _setup_step
+    global SETUP_STEP
 
     reconfigure = msg.reconfigure
     _LOG.debug("Starting driver setup, reconfigure=%s", reconfigure)
 
     if reconfigure:
-        _setup_step = SetupSteps.CONFIGURATION_MODE
+        SETUP_STEP = SetupSteps.CONFIGURATION_MODE
 
         # make sure configuration is up-to-date
         if config.devices.migration_required():
@@ -219,7 +240,7 @@ async def _handle_driver_setup(msg: DriverSetupRequest) -> RequestUserInput | Se
 
     # Initial setup, make sure we have a clean configuration
     config.devices.clear()  # triggers device instance removal
-    _setup_step = SetupSteps.DISCOVER
+    SETUP_STEP = SetupSteps.DISCOVER
     return __user_input_discovery()
 
 
@@ -235,9 +256,9 @@ async def _handle_configuration_mode(msg: UserDataResponse) -> RequestUserInput 
     :param msg: user input data from the configuration mode screen.
     :return: the setup action on how to continue
     """
-    global _setup_step
-    global _cfg_add_device
-    global _reconfigured_device
+    global SETUP_STEP
+    global cfg_add_device
+    global RECONFIGURED_DEVICE
 
     action = msg.input_values["action"]
 
@@ -246,7 +267,7 @@ async def _handle_configuration_mode(msg: UserDataResponse) -> RequestUserInput 
 
     match action:
         case "add":
-            _cfg_add_device = True
+            cfg_add_device = True
         case "remove":
             choice = msg.input_values["choice"]
             if not config.devices.remove(choice):
@@ -290,8 +311,8 @@ async def _handle_configuration_mode(msg: UserDataResponse) -> RequestUserInput 
                 }
             )
 
-            _setup_step = SetupSteps.RECONFIGURE
-            _reconfigured_device = selected_device
+            SETUP_STEP = SetupSteps.RECONFIGURE
+            RECONFIGURED_DEVICE = selected_device
             mac_address = selected_device.mac_address if selected_device.mac_address else ""
             address = selected_device.address if selected_device.address else ""
 
@@ -323,7 +344,7 @@ async def _handle_configuration_mode(msg: UserDataResponse) -> RequestUserInput 
             _LOG.error("Invalid configuration action: %s", action)
             return SetupError(error_type=IntegrationSetupError.OTHER)
 
-    _setup_step = SetupSteps.DISCOVER
+    SETUP_STEP = SetupSteps.DISCOVER
     return __user_input_discovery()
 
 
@@ -337,15 +358,15 @@ async def _handle_discovery(msg: UserDataResponse) -> RequestUserInput | SetupEr
     :param msg: response data from the requested user data
     :return: the setup action on how to continue
     """
-    global _pairing_apple_tv
-    global _setup_step
-    global _manual_address
-    global _discovered_atvs
+    global pairing_apple_tv
+    global SETUP_STEP
+    global manual_address
+    global DISCOVERED_ATVS
 
     # clear all configured devices and any previous pairing attempt
-    if _pairing_apple_tv:
-        await _pairing_apple_tv.disconnect()
-        _pairing_apple_tv = None
+    if pairing_apple_tv:
+        await pairing_apple_tv.disconnect()
+        pairing_apple_tv = None
 
     search_hosts: list[str] | None = None
     dropdown_items = []
@@ -353,16 +374,16 @@ async def _handle_discovery(msg: UserDataResponse) -> RequestUserInput | SetupEr
 
     if address:
         _LOG.debug("Starting manual driver setup for: %s", address)
-        _manual_address = True
+        manual_address = True
         # Connect to specific device and retrieve name
         search_hosts = [address]
     else:
         _LOG.debug("Starting driver setup with Apple TV discovery")
-        _manual_address = False
+        manual_address = False
 
-    _discovered_atvs = await discover.apple_tvs(asyncio.get_event_loop(), hosts=search_hosts)
+    DISCOVERED_ATVS = await discover.apple_tvs(asyncio.get_event_loop(), hosts=search_hosts)
 
-    for device in _discovered_atvs:
+    for device in DISCOVERED_ATVS:
         _LOG.info(
             "Found: %s, %s (%s)",
             device.device_info,
@@ -370,7 +391,7 @@ async def _handle_discovery(msg: UserDataResponse) -> RequestUserInput | SetupEr
             device.address,
         )
         # if we are adding a new device: make sure it's not already configured
-        if _cfg_add_device and config.devices.contains(device.identifier):
+        if cfg_add_device and config.devices.contains(device.identifier):
             _LOG.info("Skipping found device %s: already configured", device.identifier)
             continue
 
@@ -381,7 +402,7 @@ async def _handle_discovery(msg: UserDataResponse) -> RequestUserInput | SetupEr
         _LOG.warning("No Apple TVs found")
         return SetupError(error_type=IntegrationSetupError.NOT_FOUND)
 
-    _setup_step = SetupSteps.DEVICE_CHOICE
+    SETUP_STEP = SetupSteps.DEVICE_CHOICE
     return RequestUserInput(
         _a("Please choose your Apple TV"),
         [
@@ -404,8 +425,8 @@ async def _handle_device_choice(msg: UserDataResponse) -> RequestUserInput | Req
     :param msg: response data from the requested user data
     :return: the setup action on how to continue.
     """
-    global _pairing_apple_tv
-    global _setup_step
+    global pairing_apple_tv
+    global supported_protocols
 
     choice = msg.input_values["choice"]
     global_volume = msg.input_values.get("global_volume", "true") == "true"
@@ -425,12 +446,12 @@ async def _handle_device_choice(msg: UserDataResponse) -> RequestUserInput | Req
         return SetupError(error_type=IntegrationSetupError.NOT_FOUND)
 
     atv = atvs[0]
-    _pairing_apple_tv = tv.AppleTv(
+    pairing_apple_tv = tv.AppleTv(
         AtvDevice(
             identifier=choice,
             name=atv.name,
             credentials=[],
-            address=str(atv.address) if _manual_address else None,
+            address=str(atv.address) if manual_address else None,
             mac_address=choice,
             global_volume=global_volume,
         ),
@@ -438,132 +459,120 @@ async def _handle_device_choice(msg: UserDataResponse) -> RequestUserInput | Req
         pairing_atv=atv,
     )
 
-    _LOG.debug("Pairing process begin")
     # Hook up to signals
     # TODO error conditions in start_pairing?
+    # Determine supported protocols
+    supported_protocols = deque(
+        service.protocol for service in atv.services if service.protocol in MAP_PROTOCOL_TO_SETUP_STEP
+    )
+
+    _LOG.debug("Pairing process begin, protocols: %s", list(supported_protocols))
+    return await _create_next_pairing_step()
+
+
+async def _create_next_pairing_step() -> RequestUserInput | RequestUserConfirmation | SetupError | SetupComplete:
+    """
+    Advance to the next protocol pairing step.
+
+    Pops the next protocol from ``supported_protocols`` and starts its pairing process.
+    When the deque is empty all protocols have been paired and setup completes.
+
+    :return: the setup action on how to continue.
+    """
+    global current_protocol
+    global pairing_apple_tv
+    global supported_protocols
+    global SETUP_STEP
+    current_protocol = supported_protocols.popleft() if supported_protocols else None
+
+    if current_protocol is None:
+        # All protocols paired — persist the device and finish.
+        assert pairing_apple_tv is not None
+        device = AtvDevice(
+            identifier=pairing_apple_tv.identifier,
+            name=pairing_apple_tv.name,
+            credentials=pairing_apple_tv.get_credentials(),
+            address=pairing_apple_tv.address,
+            mac_address=pairing_apple_tv.identifier,
+            global_volume=pairing_apple_tv.device_config.global_volume,
+        )
+        config.devices.add_or_update(device)  # triggers ATV instance creation
+
+        # ATV device connection will be triggered with subscribe_entities request
+
+        await pairing_apple_tv.disconnect()
+        pairing_apple_tv = None
+        supported_protocols = None
+        await asyncio.sleep(1)
+
+        _LOG.info("Setup successfully completed for %s", device.name)
+
+        return SetupComplete()
+
     name = os.getenv("UC_CLIENT_NAME", socket.gethostname().split(".", 1)[0])
-    res = await _pairing_apple_tv.start_pairing(pyatv.const.Protocol.AirPlay, f"{name} Airplay")
+    res = await pairing_apple_tv.start_pairing(current_protocol, f"{name} {current_protocol.name}")
     if res is None:
         return SetupError()
 
     if res == 0:
-        _LOG.debug("Device provides AirPlay-Code")
-        _setup_step = SetupSteps.PAIRING_AIRPLAY
+        _LOG.debug("Device provides %s-Code", current_protocol.name)
+        SETUP_STEP = MAP_PROTOCOL_TO_SETUP_STEP[current_protocol]
         return RequestUserInput(
-            _a("Please enter the shown AirPlay-Code on your Apple TV"),
+            _af("Please enter the shown {protocol}-Code on your Apple TV", protocol=current_protocol.name),
             [
                 {
                     "field": {"number": {"max": 9999, "min": 0, "value": 0000}},
-                    "id": "pin_airplay",
-                    "label": _a("Apple TV AirPlay-Code"),
+                    "id": f"pin_{current_protocol.name.lower()}",
+                    "label": _af("Apple TV {protocol}-Code", protocol=current_protocol.name),
                 }
             ],
         )
 
-    _LOG.debug("We provide AirPlay-Code")
-    return RequestUserConfirmation(_af("Please enter the following AirPlay-Code on your Apple TV: {pin}", pin=res))
+    _LOG.debug("We provide %s-Code", current_protocol.name)
+    return RequestUserConfirmation(
+        _af(
+            "Please enter the following {protocol}-Code on your Apple TV: {pin}",
+            protocol=current_protocol.name,
+            pin=res,
+        )
+    )
 
 
-async def _handle_user_data_airplay_pin(
+async def _handle_user_data_pin(
     msg: UserDataResponse,
 ) -> RequestUserInput | RequestUserConfirmation | SetupError:
     """
-    Process user data airplay pairing pin response in a setup process.
+    Process user data pairing pin response in a setup process.
 
     Driver setup callback to provide requested user data during the setup process.
 
     :param msg: response data from the requested user data
     :return: the setup action on how to continue
     """
-    global _setup_step
+    assert current_protocol is not None
 
-    _LOG.debug("User has entered the AirPlay PIN")
+    _LOG.debug("User has entered the %s PIN", current_protocol.name)
 
-    if _pairing_apple_tv is None:
-        _LOG.error("Pairing Apple TV device no longer available after entering AirPlay pin. Aborting setup")
+    if pairing_apple_tv is None:
+        _LOG.error(
+            "Pairing Apple TV device no longer available after entering %s PIN. Aborting setup",
+            current_protocol.name,
+        )
         return SetupError()
 
-    await _pairing_apple_tv.enter_pin(msg.input_values["pin_airplay"])
+    pin = int(msg.input_values[f"pin_{current_protocol.name.lower()}"])
+    await pairing_apple_tv.enter_pin(pin)
 
-    res = await _pairing_apple_tv.finish_pairing()
+    res = await pairing_apple_tv.finish_pairing()
     if res is None:
         return SetupError()
 
     # Store credentials
-    c = {"protocol": AtvProtocol.AIRPLAY, "credentials": res.credentials}
-    _pairing_apple_tv.add_credentials(c)
+    c = {"protocol": MAP_PROTOCOL_TO_ATV_PROTOCOL[current_protocol], "credentials": res.credentials}
+    pairing_apple_tv.add_credentials(c)
 
-    # Start new pairing process
-    name = os.getenv("UC_CLIENT_NAME", socket.gethostname().split(".", 1)[0])
-    res = await _pairing_apple_tv.start_pairing(pyatv.const.Protocol.Companion, f"{name} Companion")
-    if res is None:
-        return SetupError()
-
-    if res == 0:
-        _LOG.debug("Device provides PIN")
-        _setup_step = SetupSteps.PAIRING_COMPANION
-        return RequestUserInput(
-            _a("Please enter the shown PIN on your Apple TV"),
-            [
-                {
-                    "field": {"number": {"max": 9999, "min": 0, "value": 0000}},
-                    "id": "pin_companion",
-                    "label": _a("Apple TV PIN"),
-                }
-            ],
-        )
-
-    _LOG.debug("We provide companion PIN")
-    return RequestUserConfirmation(_af("Please enter the following companion PIN on your Apple TV: {pin}", pin=res))
-
-
-async def _handle_user_data_companion_pin(msg: UserDataResponse) -> SetupComplete | SetupError:
-    """
-    Process user data companion pairing pin response in a setup process.
-
-    Driver setup callback to provide requested user data during the setup process.
-
-    :param msg: response data from the requested user data
-    :return: the setup action on how to continue: SetupComplete if a valid Apple TV device was chosen.
-    """
-    global _pairing_apple_tv
-
-    _LOG.debug("User has entered the Companion PIN")
-
-    if _pairing_apple_tv is None:
-        _LOG.error("Pairing Apple TV device no longer available after entering companion pin. Aborting setup")
-        return SetupError()
-
-    await _pairing_apple_tv.enter_pin(msg.input_values["pin_companion"])
-
-    res = await _pairing_apple_tv.finish_pairing()
-    await _pairing_apple_tv.disconnect()
-
-    if res is None:
-        _pairing_apple_tv = None
-        return SetupError()
-
-    c = {"protocol": AtvProtocol.COMPANION, "credentials": res.credentials}
-    _pairing_apple_tv.add_credentials(c)
-
-    device = AtvDevice(
-        identifier=_pairing_apple_tv.identifier,
-        name=_pairing_apple_tv.name,
-        credentials=_pairing_apple_tv.get_credentials(),
-        address=_pairing_apple_tv.address,
-        mac_address=_pairing_apple_tv.identifier,
-        global_volume=_pairing_apple_tv.device_config.global_volume,
-    )
-    config.devices.add_or_update(device)  # triggers ATV instance creation
-
-    # ATV device connection will be triggered with subscribe_entities request
-
-    _pairing_apple_tv = None
-    await asyncio.sleep(1)
-
-    _LOG.info("Setup successfully completed for %s", device.name)
-
-    return SetupComplete()
+    # Start next pairing process
+    return await _create_next_pairing_step()
 
 
 async def _handle_device_reconfigure(msg: UserDataResponse) -> SetupComplete | SetupError:
@@ -575,9 +584,9 @@ async def _handle_device_reconfigure(msg: UserDataResponse) -> SetupComplete | S
     """
     # flake8: noqa:F824
     # pylint: disable=W0602
-    global _reconfigured_device
+    global RECONFIGURED_DEVICE
 
-    if _reconfigured_device is None:
+    if RECONFIGURED_DEVICE is None:
         return SetupError()
 
     mac_address = msg.input_values["mac_address"]
@@ -594,19 +603,17 @@ async def _handle_device_reconfigure(msg: UserDataResponse) -> SetupComplete | S
         mac_address = manual_mac_address
 
     _LOG.debug("User has changed configuration")
-    _reconfigured_device.mac_address = mac_address
-    _reconfigured_device.address = address
-    _reconfigured_device.global_volume = global_volume
+    RECONFIGURED_DEVICE.mac_address = mac_address
+    RECONFIGURED_DEVICE.address = address
+    RECONFIGURED_DEVICE.global_volume = global_volume
 
-    config.devices.add_or_update(_reconfigured_device)  # triggers ATV instance update
+    config.devices.add_or_update(RECONFIGURED_DEVICE)  # triggers ATV instance update
 
     await asyncio.sleep(1)
     new_identifier = (
-        _reconfigured_device.identifier
-        if _reconfigured_device.mac_address is None
-        else _reconfigured_device.mac_address
+        RECONFIGURED_DEVICE.identifier if RECONFIGURED_DEVICE.mac_address is None else RECONFIGURED_DEVICE.mac_address
     )
-    _LOG.info("Setup successfully completed for %s with new identifier : %s", _reconfigured_device.name, new_identifier)
+    _LOG.info("Setup successfully completed for %s with new identifier: %s", RECONFIGURED_DEVICE.name, new_identifier)
 
     return SetupComplete()
 
@@ -618,15 +625,15 @@ def _discovered_atv_from_identifier(identifier: str) -> pyatv.interface.BaseConf
     :param identifier: ATV identifier
     :return: Device configuration if found, None otherwise
     """
-    if _discovered_atvs is None:
+    if DISCOVERED_ATVS is None:
         return None
-    for atv in _discovered_atvs:
+    for atv in DISCOVERED_ATVS:
         if atv.identifier == identifier:
             return atv
     return None
 
 
-def __user_input_discovery():
+def __user_input_discovery() -> RequestUserInput:
     return RequestUserInput(
         _a("Setup mode"),
         [
@@ -653,7 +660,7 @@ def __user_input_discovery():
     )
 
 
-def __global_volume(enabled: bool):
+def __global_volume(enabled: bool) -> dict:
     return {
         "id": "global_volume",
         "label": _a("Change volume on all connected devices"),
