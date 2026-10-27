@@ -264,7 +264,7 @@ def _add_configured_atv(device_config: config.AtvDevice, *, connect: bool = True
         device_config.identifier,
         device_config.address or "",
     )
-    atv = tv.AppleTv(device_config, loop=_LOOP)
+    atv = tv.AppleTv(device_config, loop=_LOOP, cache_dir=config.devices.data_path if config.devices else None)
     atv.events.on(tv.EVENTS.CONNECTED, on_atv_connected)
     atv.events.on(tv.EVENTS.DISCONNECTED, on_atv_disconnected)
     atv.events.on(tv.EVENTS.ERROR, on_atv_connection_error)
@@ -329,6 +329,7 @@ def on_device_removed(device: config.AtvDevice | None) -> None:
         for atv in _configured_atvs.values():
             _spawn_task(atv.disconnect())
             atv.events.remove_all_listeners()
+            atv.remove_cache()
         _configured_atvs.clear()
         api.configured_entities.clear()
         api.available_entities.clear()
@@ -337,6 +338,7 @@ def on_device_removed(device: config.AtvDevice | None) -> None:
         atv = _configured_atvs.pop(device.identifier)
         _spawn_task(atv.disconnect())
         atv.events.remove_all_listeners()
+        atv.remove_cache()
         for entity in _get_entities(atv.identifier, include_all=True):
             api.configured_entities.remove(entity.entity_id)
             api.available_entities.remove(entity.entity_id)
@@ -386,6 +388,10 @@ async def main() -> None:
     logging.getLogger("selector").setLevel(level)
     logging.getLogger("sensor").setLevel(level)
     logging.getLogger("remote").setLevel(level)
+    # ucapi sets these loggers to DEBUG on import
+    logging.getLogger("ucapi.api").setLevel(level)
+    logging.getLogger("ucapi.entities").setLevel(level)
+    logging.getLogger("ucapi.entity").setLevel(level)
 
     # logging.getLogger("pyatv").setLevel(logging.DEBUG)
 
