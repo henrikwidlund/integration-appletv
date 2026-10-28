@@ -11,20 +11,38 @@ import asyncio
 from collections.abc import Callable
 from copy import copy
 import logging
+from random import randint
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 from pyatv import exceptions
 from pyatv.auth import hap_tlv8
-from pyatv.auth.hap_pairing import HapCredentials, PairSetupProcedure
+from pyatv.auth.hap_channel import setup_channel
+from pyatv.auth.hap_pairing import HapCredentials, PairSetupProcedure, parse_credentials
 from pyatv.auth.hap_srp import SRPAuthHandler
 from pyatv.core import SetupData
 from pyatv.core.facade import FacadeAppleTV
+from pyatv.protocols.airplay.ap2_session import (
+    DATASTREAM_INPUT_INFO,
+    DATASTREAM_OUTPUT_INFO,
+    DATASTREAM_SALT,
+    EVENTS_READ_INFO,
+    EVENTS_SALT,
+    EVENTS_WRITE_INFO,
+    AP2Session,
+)
 from pyatv.protocols.airplay.auth.hap import _AIRPLAY_HEADERS, AirPlayHapPairSetupProcedure, _get_pairing_data
 from pyatv.protocols.airplay.auth.legacy import AirPlayLegacyPairSetupProcedure
+from pyatv.protocols.airplay.channels import DataStreamChannel, EventChannel
 from pyatv.protocols.airplay.pairing import AirPlayMajorVersion, AirPlayPairingHandler, AuthenticationType
 from pyatv.protocols.airplay.srp import LegacySRPAuthHandler, new_credentials
+from pyatv.protocols.companion.api import CompanionAPI
+from pyatv.protocols.companion.connection import CompanionConnection
+from pyatv.protocols.companion.protocol import CompanionProtocol
+from pyatv.protocols.mrp import messages, protobuf
+from pyatv.protocols.mrp.protocol import MrpProtocol, ProtocolState
 from pyatv.support import error_handler
-from pyatv.support.http import HttpConnection, http_connect
+from pyatv.support.http import HttpConnection, decode_bplist_from_body, http_connect
 
 if TYPE_CHECKING:
     from pyatv.const import Protocol
@@ -229,3 +247,175 @@ async def patched_facade_connect(self: FacadeAppleTV) -> None:
         _close_started(self, started)
         _keep_close_tasks(self.close())
         raise
+
+
+async def patched_companion_api_connect(self: CompanionAPI) -> None:
+    """Connect to the Apple TV. Send the setup commands without waiting for each reply.
+
+    The commands are sent in the same order as in pyatv. The replies are matched by transaction id.
+    """
+    if self._protocol:
+        return
+
+    _LOG.debug("Connect to Companion from API")
+    self._connection = CompanionConnection(
+        self.core.loop,
+        str(self.core.config.address),
+        self.core.service.port,
+        self.core.device_listener,
+    )
+    self._protocol = CompanionProtocol(self._connection, SRPAuthHandler(), self.core.service)
+    self._protocol.listener = self
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await self._protocol.start()
+    verified = loop.time()
+
+    await asyncio.gather(
+        self.system_info(),
+        self._touch_start(),
+        self._session_start(),
+        self._tv_rc_session_start(),
+        self._text_input_start(),
+    )
+    await self.subscribe_event("_iMC")
+    _LOG.debug("Companion: verified in %.2fs, setup in %.2fs", verified - start, loop.time() - verified)
+
+
+async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: bool = False) -> None:  # noqa: FBT001, FBT002 same signature as pyatv
+    """Connect to the Apple TV. Send the last two setup messages without waiting for each reply.
+
+    The messages are sent in the same order as in pyatv. The replies are matched by identifier.
+    """
+    if self._state != ProtocolState.NOT_CONNECTED:
+        raise exceptions.InvalidStateError(self._state.name)
+
+    self._state = ProtocolState.CONNECTING
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+
+    try:
+        await self.connection.connect()
+
+        self._state = ProtocolState.CONNECTED
+
+        # Credentials from outside of pairing: use their client id
+        if self.service.credentials:
+            self.srp.pairing_id = parse_credentials(self.service.credentials).client_id
+
+        # The first message must always be DEVICE_INFORMATION, otherwise the device does not respond
+        self.device_info = await self.send_and_receive(
+            messages.device_information(self.info, self.srp.pairing_id.decode())
+        )
+        # send_and_receive does not send the device information to the listeners
+        self.dispatch(protobuf.DEVICE_INFO_MESSAGE, self.device_info)
+
+        if skip_initial_messages:
+            return
+
+        await error_handler(self._enable_encryption, exceptions.AuthenticationError)
+
+        # First message after encryption is enabled
+        await self.send(messages.set_connection_state())
+
+        await asyncio.gather(
+            self.send_and_receive(messages.client_updates_config()),
+            self.send_and_receive(messages.get_keyboard_session()),
+        )
+    except Exception:
+        self.stop()
+        raise
+
+    self._state = ProtocolState.READY
+    _LOG.debug("MRP: started in %.2fs", loop.time() - start)
+
+
+async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
+    """Set up the remote control session. Send the RTSP requests without waiting for each reply.
+
+    The requests are sent in the same order as in pyatv. The replies are matched by CSeq.
+    The event channel and the data channel are connected at the same time.
+    """
+    if self.connection is None or self.rtsp is None or self.verifier is None:
+        msg = "not connected to remote"
+        raise exceptions.InvalidStateError(msg)
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    address = self.connection.remote_ip
+    # A 64 bit random seed is part of the data channel encryption salt
+    seed = randint(0, 2**64)  # noqa: S311 same as pyatv, not a secret
+
+    event_resp, _, data_resp = await asyncio.gather(
+        self.rtsp.setup(
+            body={
+                "isRemoteControlOnly": True,
+                "osName": self._info.os_name,
+                "sourceVersion": "550.10",
+                "timingProtocol": "None",
+                "model": self._info.model,
+                "deviceID": self._info.device_id,
+                "osVersion": self._info.os_version,
+                "osBuildVersion": self._info.os_build,
+                "macAddress": self._info.mac,
+                "sessionUUID": str(uuid4()).upper(),
+                "name": self._info.name,
+            }
+        ),
+        self.rtsp.record(),
+        self.rtsp.setup(
+            body={
+                "streams": [
+                    {
+                        "controlType": 2,
+                        "channelID": str(uuid4()).upper(),
+                        "seed": seed,
+                        "clientUUID": str(uuid4()).upper(),
+                        "type": 130,
+                        "wantsDedicatedSocket": True,
+                        "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
+                    }
+                ]
+            }
+        ),
+    )
+    requested = loop.time()
+    event_port = decode_bplist_from_body(event_resp)["eventPort"]
+    data_port = decode_bplist_from_body(data_resp)["streams"][0]["dataPort"]
+
+    # The event channel is not used, but it must be set up.
+    # Read and write info are swapped: the receiver starts the event connection.
+    results = await asyncio.gather(
+        setup_channel(
+            EventChannel,
+            self.verifier,
+            address,
+            event_port,
+            EVENTS_SALT,
+            EVENTS_READ_INFO,
+            EVENTS_WRITE_INFO,
+        ),
+        setup_channel(
+            DataStreamChannel,
+            self.verifier,
+            address,
+            data_port,
+            DATASTREAM_SALT + str(seed),
+            DATASTREAM_OUTPUT_INFO,
+            DATASTREAM_INPUT_INFO,
+        ),
+        return_exceptions=True,
+    )
+    # Keep the connected channels, so stop() closes them also when the other channel failed
+    for result in results:
+        if not isinstance(result, BaseException):
+            self._channels.append(result[0])
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+
+    self.data_channel = cast("DataStreamChannel", cast("tuple[Any, Any]", results[1])[1])
+    _LOG.debug(
+        "AirPlay: remote control requests in %.2fs, channels in %.2fs", requested - start, loop.time() - requested
+    )

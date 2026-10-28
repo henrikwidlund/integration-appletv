@@ -14,9 +14,12 @@ import sys
 from typing import Any, cast
 
 from pyatv.core.facade import FacadeAppleTV
+from pyatv.protocols.airplay.ap2_session import AP2Session
 import pyatv.protocols.airplay.auth as airplay_auth
 import pyatv.protocols.airplay.auth.hap as airplay_auth_hap
 import pyatv.protocols.airplay.pairing as airplay_pairing
+from pyatv.protocols.companion.api import CompanionAPI
+from pyatv.protocols.mrp.protocol import MrpProtocol
 from typing_extensions import override
 import ucapi
 from ucapi import Entity, media_player
@@ -411,6 +414,11 @@ async def main() -> None:
     # The connect patch also connects all protocols at the same time instead of one after the other.
     FacadeAppleTV.add_protocol = monkey_patch.patched_facade_add_protocol
     FacadeAppleTV.connect = monkey_patch.patched_facade_connect
+
+    # Patch: send the connect requests of each protocol without waiting for each reply, to connect faster.
+    CompanionAPI.connect = monkey_patch.patched_companion_api_connect
+    MrpProtocol.start = monkey_patch.patched_mrp_protocol_start
+    AP2Session.setup_remote_control = monkey_patch.patched_ap2_session_setup_remote_control
 
     # load paired devices
     config.devices = config.Devices(api.config_dir_path, on_device_added, on_device_removed, on_device_updated)
