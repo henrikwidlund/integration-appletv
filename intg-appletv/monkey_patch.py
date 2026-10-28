@@ -332,7 +332,7 @@ async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: b
 
 
 async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
-    """Set up the remote control session. Send the RTSP requests without waiting for each reply.
+    """Set up the remote control session. Send RECORD and the stream SETUP without waiting for each reply.
 
     The requests are sent in the same order as in pyatv. The replies are matched by CSeq.
     The event channel and the data channel are connected at the same time.
@@ -347,8 +347,9 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
     # A 64 bit random seed is part of the data channel encryption salt
     seed = randint(0, 2**64)  # noqa: S311 same as pyatv, not a secret
 
-    event_resp, _, data_resp = await asyncio.gather(
-        self.rtsp.setup(
+    try:
+        # The first SETUP creates the session, the Apple TV needs it before the next requests
+        event_resp = await self.rtsp.setup(
             body={
                 "isRemoteControlOnly": True,
                 "osName": self._info.os_name,
@@ -362,24 +363,28 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
                 "sessionUUID": str(uuid4()).upper(),
                 "name": self._info.name,
             }
-        ),
-        self.rtsp.record(),
-        self.rtsp.setup(
-            body={
-                "streams": [
-                    {
-                        "controlType": 2,
-                        "channelID": str(uuid4()).upper(),
-                        "seed": seed,
-                        "clientUUID": str(uuid4()).upper(),
-                        "type": 130,
-                        "wantsDedicatedSocket": True,
-                        "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
-                    }
-                ]
-            }
-        ),
-    )
+        )
+        _, data_resp = await asyncio.gather(
+            self.rtsp.record(),
+            self.rtsp.setup(
+                body={
+                    "streams": [
+                        {
+                            "controlType": 2,
+                            "channelID": str(uuid4()).upper(),
+                            "seed": seed,
+                            "clientUUID": str(uuid4()).upper(),
+                            "type": 130,
+                            "wantsDedicatedSocket": True,
+                            "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
+                        }
+                    ]
+                }
+            ),
+        )
+    except Exception as ex:
+        _LOG.warning("AirPlay: remote control requests failed: %r", ex)
+        raise
     requested = loop.time()
     event_port = decode_bplist_from_body(event_resp)["eventPort"]
     data_port = decode_bplist_from_body(data_resp)["streams"][0]["dataPort"]
@@ -413,6 +418,7 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
             self._channels.append(result[0])
     for result in results:
         if isinstance(result, BaseException):
+            _LOG.warning("AirPlay: remote control channels failed: %r", result)
             raise result
 
     self.data_channel = cast("DataStreamChannel", cast("tuple[Any, Any]", results[1])[1])

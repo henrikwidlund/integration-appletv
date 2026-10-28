@@ -218,7 +218,7 @@ def _ap2_session(requests: Requests) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_airplay_sends_requests_before_replies_and_connects_channels_at_same_time(
+async def test_airplay_pipelines_requests_after_first_setup_and_connects_channels_at_same_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     running = 0
@@ -239,7 +239,8 @@ async def test_airplay_sends_requests_before_replies_and_connects_channels_at_sa
     await monkey_patch.patched_ap2_session_setup_remote_control(session)
 
     assert requests.sent == ["SETUP event", "RECORD", "SETUP streams"]
-    assert requests.sent_at_reply == [3, 3, 3]
+    # RECORD and the stream SETUP are sent after the first SETUP reply
+    assert requests.sent_at_reply == [1, 3, 3]
     assert max_running == 2
     assert session._channels == ["transport 1", "transport 2"]
     assert session.data_channel == "channel 2"
