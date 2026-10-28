@@ -11,7 +11,7 @@ import asyncio
 from collections.abc import Callable
 from copy import copy
 import logging
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pyatv import exceptions
 from pyatv.auth import hap_tlv8
@@ -25,6 +25,9 @@ from pyatv.protocols.airplay.pairing import AirPlayMajorVersion, AirPlayPairingH
 from pyatv.protocols.airplay.srp import LegacySRPAuthHandler, new_credentials
 from pyatv.support import error_handler
 from pyatv.support.http import HttpConnection, http_connect
+
+if TYPE_CHECKING:
+    from pyatv.const import Protocol
 
 _LOG = logging.getLogger(__name__)
 HapPairSetupProcedureFactory = Callable[[HttpConnection, SRPAuthHandler, str | None], AirPlayHapPairSetupProcedure]
@@ -158,19 +161,71 @@ def patched_facade_add_protocol(self: FacadeAppleTV, setup_data: SetupData) -> N
     close = setup_data.close
 
     async def _connect() -> bool:
+        loop = asyncio.get_running_loop()
+        start = loop.time()
         try:
-            return await connect()
+            result = await connect()
         except BaseException:
             _keep_close_tasks(close())
             raise
+        _LOG.debug("Connected to %s in %.2fs", setup_data.protocol.name, loop.time() - start)
+        return result
 
     _original_facade_add_protocol(self, setup_data._replace(connect=_connect))
 
 
+def _retrieve_exception(task: asyncio.Task[bool]) -> None:
+    """Mark the exception as retrieved. pyatv only awaits the protocols up to the first failure."""
+    if not task.cancelled():
+        task.exception()
+
+
+def _start_connects(atv: FacadeAppleTV) -> list[tuple[SetupData, asyncio.Task[bool]]]:
+    """Start the connect of all protocols at the same time.
+
+    pyatv connects one protocol after the other. The queued protocols get the started task as connect,
+    so pyatv still registers them in the same order.
+    """
+    queue = atv._protocols_to_setup  # noqa: SLF001
+    queued: list[SetupData] = []
+    started: list[tuple[SetupData, asyncio.Task[bool]]] = []
+    protocols: set[Protocol] = set()
+    while not queue.empty():
+        setup_data = queue.get()
+        # pyatv only connects a duplicate protocol if the first one did not connect. Keep that order for duplicates.
+        if setup_data.protocol not in protocols:
+            protocols.add(setup_data.protocol)
+            task = asyncio.ensure_future(setup_data.connect())
+            task.add_done_callback(_retrieve_exception)
+            started.append((setup_data, task))
+            setup_data = setup_data._replace(connect=lambda task=task: task)
+        queued.append(setup_data)
+    for setup_data in queued:
+        queue.put(setup_data)
+    return started
+
+
+def _close_started(atv: FacadeAppleTV, started: list[tuple[SetupData, asyncio.Task[bool]]]) -> None:
+    """Stop the started protocols that pyatv has not registered."""
+    for setup_data, task in started:
+        if not task.done():
+            # The connect wrapper of patched_facade_add_protocol closes the protocol
+            task.cancel()
+        elif (
+            not task.cancelled()
+            and task.exception() is None
+            and task.result()
+            and setup_data.protocol not in atv._protocol_handlers  # noqa: SLF001
+        ):
+            _keep_close_tasks(setup_data.close())
+
+
 async def patched_facade_connect(self: FacadeAppleTV) -> None:
-    """Connect all protocols. Close the already connected protocols if connect fails or is canceled."""
+    """Connect all protocols at the same time. Close the connected protocols if connect fails or is canceled."""
+    started = _start_connects(self)
     try:
         await _original_facade_connect(self)
     except BaseException:
+        _close_started(self, started)
         _keep_close_tasks(self.close())
         raise

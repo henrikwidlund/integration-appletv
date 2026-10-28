@@ -388,6 +388,7 @@ async def main() -> None:
     logging.getLogger("selector").setLevel(level)
     logging.getLogger("sensor").setLevel(level)
     logging.getLogger("remote").setLevel(level)
+    logging.getLogger("monkey_patch").setLevel(level)
     # ucapi sets these loggers to DEBUG on import
     logging.getLogger("ucapi.api").setLevel(level)
     logging.getLogger("ucapi.entities").setLevel(level)
@@ -407,6 +408,7 @@ async def main() -> None:
 
     # Patch: pyatv leaves partially connected protocols open when connect fails.
     # TODO remove when fixed in pyatv
+    # The connect patch also connects all protocols at the same time instead of one after the other.
     FacadeAppleTV.add_protocol = monkey_patch.patched_facade_add_protocol
     FacadeAppleTV.connect = monkey_patch.patched_facade_connect
 
