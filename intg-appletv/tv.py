@@ -69,11 +69,11 @@ NETWORK_RETRY_TIMEOUT = 3.0
 """Maximum seconds to retry while the network is unreachable. After that, the normal connect delay is used."""
 CONNECT_TIMEOUT = 15.0
 """Maximum time in seconds to wait for pyatv.connect() to complete, comfortably above pyatv's own protocol timeouts."""
-CONNECT_STALL_TIMEOUT = 0.7
+CONNECT_STALL_TIMEOUT = 0.5
 """Seconds before the first connect of a connect loop is started again.
 
 After wake-up, the WiFi link of the remote can go down for a short time during the connect. Lost packets then
-wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.5s.
+wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.4s.
 """
 APP_LIST_REFRESH_INTERVAL = 300.0
 OUTPUT_REFRESH_INTERVAL = 300.0
@@ -836,8 +836,9 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
             return ConnectResult.FAILED
         except Exception as err:  # noqa: BLE001
             self._atv = None
-            # OSError(101, 'Network is unreachable') or 10065 for Windows
-            if isinstance(err.__cause__, OSError) and err.__cause__.errno in (101, 10065):
+            # OSError(101, 'Network is unreachable') or 10065 for Windows, raised directly or as cause
+            cause = err if isinstance(err, OSError) else err.__cause__
+            if isinstance(cause, OSError) and cause.errno in (101, 10065):
                 _LOG.debug("[%s] Network may not be ready yet: %s", self.log_id, err)
                 return ConnectResult.NETWORK_UNREACHABLE
             _LOG.warning("[%s] Could not connect: %s", self.log_id, err)

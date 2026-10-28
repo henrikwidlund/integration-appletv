@@ -64,6 +64,17 @@ async def test_connect_once_reports_network_unreachable() -> None:
     assert apple_tv._apple_tv_conf is conf
 
 
+async def test_connect_once_reports_direct_network_error() -> None:
+    """A network error raised directly, not as cause, is also reported as NETWORK_UNREACHABLE."""
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    conf = MagicMock()
+    apple_tv._apple_tv_conf = conf
+    apple_tv._connect = AsyncMock(side_effect=OSError(101, "Network is unreachable"))
+
+    assert await apple_tv._connect_once() is ConnectResult.NETWORK_UNREACHABLE
+    assert apple_tv._apple_tv_conf is conf
+
+
 async def test_connect_once_other_error_resets_conf() -> None:
     """Other errors are reported as FAILED and drop the cached configuration."""
     apple_tv = AppleTv(_device(), asyncio.get_running_loop())
