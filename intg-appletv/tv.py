@@ -69,6 +69,12 @@ NETWORK_RETRY_TIMEOUT = 3.0
 """Maximum seconds to retry while the network is unreachable. After that, the normal connect delay is used."""
 CONNECT_TIMEOUT = 15.0
 """Maximum time in seconds to wait for pyatv.connect() to complete, comfortably above pyatv's own protocol timeouts."""
+CONNECT_STALL_TIMEOUT = 0.7
+"""Seconds before the first connect of a connect loop is started again.
+
+After wake-up, the WiFi link of the remote can go down for a short time during the connect. Lost packets then
+wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.5s.
+"""
 APP_LIST_REFRESH_INTERVAL = 300.0
 OUTPUT_REFRESH_INTERVAL = 300.0
 CONNECT_WAIT_FOR_COMMAND = 3.0
@@ -104,6 +110,12 @@ class ConnectResult(Enum):
     FAILED = 2
     NETWORK_UNREACHABLE = 3
     """The network is not ready yet, e.g. right after wake-up."""
+    STALLED = 4
+    """The connect did not finish within CONNECT_STALL_TIMEOUT."""
+
+
+class ConnectStalledError(TimeoutError):
+    """pyatv.connect() did not finish within the stall timeout."""
 
 
 class PlaybackState(Enum):
@@ -694,27 +706,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
     async def _connect_loop(self) -> None:
         _LOG.debug("[%s] Starting connect loop", self.log_id)
         start = self._loop.time()
-        tries = 0
-        network_retries = 0
-        network_retry_end: float | None = None
-        while self._is_enabled and self._atv is None and not self._auth_failed:
-            tries += 1
-            result = await self._connect_once()
-            if result is ConnectResult.CONNECTED:
-                break
-            if result is ConnectResult.NETWORK_UNREACHABLE:
-                now = self._loop.time()
-                if network_retry_end is None:
-                    network_retry_end = now + NETWORK_RETRY_TIMEOUT
-                if now < network_retry_end:
-                    network_retries += 1
-                    await asyncio.sleep(NETWORK_RETRY_INTERVAL)
-                    continue
-                _LOG.warning("[%s] Could not connect, network not ready", self.log_id)
-            self._connection_attempts += 1
-            backoff = self._backoff()
-            _LOG.debug("[%s] Trying to connect again in %ds", self.log_id, backoff)
-            await asyncio.sleep(backoff)
+        tries, network_retries = await self._try_connect()
 
         _LOG.debug("[%s] Connect loop ended", self.log_id)
         self._connect_task = None
@@ -770,6 +762,36 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
             _LOG.exception("[%s] Error during post-connect setup, reconnecting: %s", self.log_id, err)
             self._handle_disconnect(force=True)
 
+    async def _try_connect(self) -> tuple[int, int]:
+        """Connect until connected, disabled or authentication failed. Return the tries and network retries."""
+        tries = 0
+        network_retries = 0
+        network_retry_end: float | None = None
+        # Only one connect per loop is started again after a stall, so a slow network still connects
+        stall_timeout: float | None = CONNECT_STALL_TIMEOUT
+        while self._is_enabled and self._atv is None and not self._auth_failed:
+            tries += 1
+            result = await self._connect_once(stall_timeout)
+            if result is ConnectResult.CONNECTED:
+                break
+            if result is ConnectResult.STALLED:
+                stall_timeout = None
+                continue
+            if result is ConnectResult.NETWORK_UNREACHABLE:
+                now = self._loop.time()
+                if network_retry_end is None:
+                    network_retry_end = now + NETWORK_RETRY_TIMEOUT
+                if now < network_retry_end:
+                    network_retries += 1
+                    await asyncio.sleep(NETWORK_RETRY_INTERVAL)
+                    continue
+                _LOG.warning("[%s] Could not connect, network not ready", self.log_id)
+            self._connection_attempts += 1
+            backoff = self._backoff()
+            _LOG.debug("[%s] Trying to connect again in %ds", self.log_id, backoff)
+            await asyncio.sleep(backoff)
+        return tries, network_retries
+
     def _refresh_after_connect(self, atv: pyatv.interface.AppleTV) -> bool:
         """Start the app list and output devices refresh after connect. Return True if output devices are scanned."""
         # Fresh connection: allow one prompt fetch of the app list and output devices if they are
@@ -795,13 +817,16 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
         self._next_output_refresh = now + OUTPUT_REFRESH_INTERVAL
         return output_devices_stale
 
-    async def _connect_once(self) -> ConnectResult:
+    async def _connect_once(self, stall_timeout: float | None = None) -> ConnectResult:
         try:
             # Reuse the latest AppleTV instance (Mac and IP) if defined to avoid a scan
             if self._apple_tv_conf is None:
                 self._apple_tv_conf = await self._find_atv()
             if self._apple_tv_conf:
-                await self._connect(self._apple_tv_conf)
+                await self._connect(self._apple_tv_conf, stall_timeout)
+        except ConnectStalledError as err:
+            _LOG.debug("[%s] %s, trying again", self.log_id, err)
+            return ConnectResult.STALLED
         except pyatv.exceptions.AuthenticationError:
             _LOG.warning("[%s] Could not connect: authentication error", self.log_id)
             self._auth_failed = True
@@ -821,7 +846,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
             return ConnectResult.FAILED
         return ConnectResult.CONNECTED if self._atv is not None else ConnectResult.FAILED
 
-    async def _connect(self, conf: pyatv.interface.BaseConfig) -> None:
+    async def _connect(self, conf: pyatv.interface.BaseConfig, stall_timeout: float | None = None) -> None:
         # We try to connect with all the protocols.
         # If something is not ready yet, we try again afterward
         missing_protocols = []
@@ -872,12 +897,15 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
         # Separate task: if connect finishes at the same time as the timeout, the instance can still be closed
         connect_task = self._loop.create_task(pyatv.connect(conf, self._loop))
         try:
-            await asyncio.wait((connect_task,), timeout=CONNECT_TIMEOUT)
+            await asyncio.wait((connect_task,), timeout=stall_timeout or CONNECT_TIMEOUT)
         except asyncio.CancelledError:
             self._discard_connect_task(connect_task)
             raise
         if not connect_task.done():
             self._discard_connect_task(connect_task)
+            if stall_timeout:
+                msg = f"connect stalled after {stall_timeout}s"
+                raise ConnectStalledError(msg)
             msg = f"connect timed out after {CONNECT_TIMEOUT}s"
             raise TimeoutError(msg)
         self._atv = connect_task.result()

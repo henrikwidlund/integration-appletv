@@ -21,7 +21,7 @@ from ucapi.media_player import Attributes as MediaAttr
 
 from config import AtvDevice
 import tv
-from tv import AppleTv, ConnectResult
+from tv import AppleTv, ConnectResult, ConnectStalledError
 
 pytestmark = pytest.mark.asyncio
 
@@ -123,6 +123,50 @@ async def test_network_retry_stops_when_disabled(monkeypatch: pytest.MonkeyPatch
     calls = await _run_connect_loop(apple_tv, [ConnectResult.NETWORK_UNREACHABLE], disable_on_call=True)
 
     assert calls == 1
+
+
+# ---- stalled connect ----
+
+
+async def test_stalled_connect_is_retried_once_without_backoff() -> None:
+    """The first stalled connect is started again at once, later connects use the normal timeout."""
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    stall_timeouts: list[float | None] = []
+    results = [ConnectResult.NETWORK_UNREACHABLE, ConnectResult.STALLED, ConnectResult.CONNECTED]
+
+    calls = await _run_connect_loop(apple_tv, results, stall_timeouts=stall_timeouts)
+
+    assert calls == 3
+    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT, None]
+    apple_tv._backoff.assert_not_called()
+
+
+async def test_connect_once_reports_stalled_and_keeps_conf() -> None:
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    conf = MagicMock()
+    apple_tv._apple_tv_conf = conf
+    apple_tv._connect = AsyncMock(side_effect=ConnectStalledError("connect stalled after 0.7s"))
+
+    assert await apple_tv._connect_once(0.7) is ConnectResult.STALLED
+    assert apple_tv._apple_tv_conf is conf
+
+
+async def test_connect_raises_stalled_after_stall_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    started = asyncio.Event()
+
+    async def connect(*_args: object) -> None:
+        started.set()
+        await asyncio.sleep(100)
+
+    monkeypatch.setattr(tv.pyatv, "connect", connect)
+    conf = MagicMock()
+    conf.name = _device().name
+
+    with pytest.raises(ConnectStalledError):
+        await apple_tv._connect(conf, 0.01)
+    assert started.is_set()
+    assert apple_tv._atv is None
 
 
 # ---- command wait ----
@@ -287,14 +331,17 @@ async def _run_connect_loop(
     *,
     disable_on_call: bool = False,
     backoff: float = 0,
+    stall_timeouts: list[float | None] | None = None,
 ) -> int:
     """Run the connect loop with the given connect results. Return the number of connect attempts."""
     pending = iter(results or [ConnectResult.CONNECTED])
     calls = 0
 
-    async def connect_once() -> ConnectResult:
+    async def connect_once(stall_timeout: float | None = None) -> ConnectResult:
         nonlocal calls
         calls += 1
+        if stall_timeouts is not None:
+            stall_timeouts.append(stall_timeout)
         if disable_on_call:
             apple_tv._is_enabled = False
         result = next(pending)
