@@ -218,36 +218,28 @@ def _ap2_session(requests: Requests) -> Any:
 
 
 @pytest.mark.asyncio
-async def test_airplay_sends_requests_in_order_and_connects_channels_at_same_time(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    running = 0
-    max_running = 0
+async def test_airplay_connects_event_channel_before_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = Requests()
 
     async def setup_channel(_factory: Any, _verifier: Any, _address: str, port: int, *_args: Any) -> tuple[Any, Any]:
-        nonlocal running, max_running
-        running += 1
-        max_running = max(max_running, running)
-        await asyncio.sleep(0.01)
-        running -= 1
+        requests.sent.append(f"channel {port}")
         return f"transport {port}", f"channel {port}"
 
     monkeypatch.setattr(monkey_patch, "setup_channel", setup_channel)
-    requests = Requests()
     session = _ap2_session(requests)
 
     await monkey_patch.patched_ap2_session_setup_remote_control(session)
 
-    assert requests.sent == ["SETUP event", "RECORD", "SETUP streams"]
-    # The Apple TV needs each RTSP reply before the next request
-    assert requests.sent_at_reply == [1, 2, 3]
-    assert max_running == 2
+    # The Apple TV replies to RECORD only after the event channel is connected
+    assert requests.sent == ["SETUP event", "channel 1", "RECORD", "SETUP streams", "channel 2"]
+    # RECORD and SETUP streams are sent before the replies
+    assert requests.sent_at_reply == [1, 4, 4]
     assert session._channels == ["transport 1", "transport 2"]
     assert session.data_channel == "channel 2"
 
 
 @pytest.mark.asyncio
-async def test_airplay_keeps_connected_channel_when_other_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_airplay_keeps_event_channel_when_data_channel_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     async def setup_channel(_factory: Any, _verifier: Any, _address: str, port: int, *_args: Any) -> tuple[Any, Any]:
         if port == 2:
             raise ConnectionRefusedError

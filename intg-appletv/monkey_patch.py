@@ -332,10 +332,9 @@ async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: b
 
 
 async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
-    """Set up the remote control session. Connect the event channel and the data channel at the same time.
+    """Set up the remote control session. Send RECORD and the data stream SETUP without waiting for each reply.
 
-    The RTSP requests are sent one after the other: the Apple TV does not reply to RECORD
-    when the next request is sent before the reply.
+    The Apple TV replies to RECORD only after the event channel is connected.
     """
     if self.connection is None or self.rtsp is None or self.verifier is None:
         msg = "not connected to remote"
@@ -363,62 +362,57 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
                 "name": self._info.name,
             }
         )
-        await self.rtsp.record()
-        data_resp = await self.rtsp.setup(
-            body={
-                "streams": [
-                    {
-                        "controlType": 2,
-                        "channelID": str(uuid4()).upper(),
-                        "seed": seed,
-                        "clientUUID": str(uuid4()).upper(),
-                        "type": 130,
-                        "wantsDedicatedSocket": True,
-                        "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
-                    }
-                ]
-            }
-        )
-    except Exception as ex:
-        _LOG.warning("AirPlay: remote control requests failed: %r", ex)
-        raise
-    requested = loop.time()
-    event_port = decode_bplist_from_body(event_resp)["eventPort"]
-    data_port = decode_bplist_from_body(data_resp)["streams"][0]["dataPort"]
-
-    # The event channel is not used, but it must be set up.
-    # Read and write info are swapped: the receiver starts the event connection.
-    results = await asyncio.gather(
-        setup_channel(
+        # The event channel is not used, but it must be set up.
+        # Read and write info are swapped: the receiver starts the event connection.
+        event_transport, _ = await setup_channel(
             EventChannel,
             self.verifier,
             address,
-            event_port,
+            decode_bplist_from_body(event_resp)["eventPort"],
             EVENTS_SALT,
             EVENTS_READ_INFO,
             EVENTS_WRITE_INFO,
-        ),
-        setup_channel(
+        )
+        self._channels.append(event_transport)
+        event_done = loop.time()
+
+        _, data_resp = await asyncio.gather(
+            self.rtsp.record(),
+            self.rtsp.setup(
+                body={
+                    "streams": [
+                        {
+                            "controlType": 2,
+                            "channelID": str(uuid4()).upper(),
+                            "seed": seed,
+                            "clientUUID": str(uuid4()).upper(),
+                            "type": 130,
+                            "wantsDedicatedSocket": True,
+                            "clientTypeUUID": "1910A70F-DBC0-4242-AF95-115DB30604E1",
+                        }
+                    ]
+                }
+            ),
+        )
+        requested = loop.time()
+
+        data_transport, data_channel = await setup_channel(
             DataStreamChannel,
             self.verifier,
             address,
-            data_port,
+            decode_bplist_from_body(data_resp)["streams"][0]["dataPort"],
             DATASTREAM_SALT + str(seed),
             DATASTREAM_OUTPUT_INFO,
             DATASTREAM_INPUT_INFO,
-        ),
-        return_exceptions=True,
-    )
-    # Keep the connected channels, so stop() closes them also when the other channel failed
-    for result in results:
-        if not isinstance(result, BaseException):
-            self._channels.append(result[0])
-    for result in results:
-        if isinstance(result, BaseException):
-            _LOG.warning("AirPlay: remote control channels failed: %r", result)
-            raise result
-
-    self.data_channel = cast("DataStreamChannel", cast("tuple[Any, Any]", results[1])[1])
+        )
+    except Exception as ex:
+        _LOG.warning("AirPlay: remote control setup failed: %r", ex)
+        raise
+    self._channels.append(data_transport)
+    self.data_channel = cast("DataStreamChannel", data_channel)
     _LOG.debug(
-        "AirPlay: remote control requests in %.2fs, channels in %.2fs", requested - start, loop.time() - requested
+        "AirPlay: event channel in %.2fs, RECORD and data SETUP in %.2fs, data channel in %.2fs",
+        event_done - start,
+        requested - event_done,
+        loop.time() - requested,
     )
