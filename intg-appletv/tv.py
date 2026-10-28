@@ -193,7 +193,13 @@ def async_handle_atvlib_errors(
             # Give an in-flight connection a brief moment so a command right after wake can land.
             # asyncio.wait does not cancel the connect task on timeout.
             if connect_task := self._connect_task:  # pyright: ignore[reportPrivateUsage]
+                start = self._loop.time()  # pyright: ignore[reportPrivateUsage]
                 await asyncio.wait((connect_task,), timeout=CONNECT_WAIT_FOR_COMMAND)
+                _LOG.debug(
+                    "[%s] Command waited %.2fs for connect",
+                    self.log_id,
+                    self._loop.time() - start,  # pyright: ignore[reportPrivateUsage]
+                )
             if self._atv is None:  # pyright: ignore[reportPrivateUsage]
                 return StatusCodes.SERVICE_UNAVAILABLE
 
@@ -687,8 +693,12 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
 
     async def _connect_loop(self) -> None:
         _LOG.debug("[%s] Starting connect loop", self.log_id)
+        start = self._loop.time()
+        tries = 0
+        network_retries = 0
         network_retry_end: float | None = None
         while self._is_enabled and self._atv is None and not self._auth_failed:
+            tries += 1
             result = await self._connect_once()
             if result is ConnectResult.CONNECTED:
                 break
@@ -697,6 +707,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
                 if network_retry_end is None:
                     network_retry_end = now + NETWORK_RETRY_TIMEOUT
                 if now < network_retry_end:
+                    network_retries += 1
                     await asyncio.sleep(NETWORK_RETRY_INTERVAL)
                     continue
                 _LOG.warning("[%s] Could not connect, network not ready", self.log_id)
@@ -736,7 +747,13 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
             if not output_devices_stale:
                 # No scan: send the current output device, it may have changed during sleep.
                 self.events.emit(EVENTS.UPDATE, self._device.identifier, {MediaAttr.SOUND_MODE: self.output_devices})
-            _LOG.debug("[%s] Connected", self.log_id)
+            _LOG.debug(
+                "[%s] Connected in %.2fs (%d tries, %d network retries)",
+                self.log_id,
+                self._loop.time() - start,
+                tries,
+                network_retries,
+            )
         except pyatv.exceptions.BlockedStateError as err:
             # The pyatv facade was already closed/blocked before we could finish setup.
             # This happens when the remote side drops the connection in the narrow window
@@ -1057,6 +1074,7 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
         self._app_list = apps
         self._available_output_devices = output_devices
         self._rebuild_output_devices()
+        _LOG.debug("[%s] Loaded cache: %d apps, %d output devices", self.log_id, len(apps), len(output_devices))
 
     def remove_cache(self) -> None:
         """Delete the cache file and stop writing it."""
