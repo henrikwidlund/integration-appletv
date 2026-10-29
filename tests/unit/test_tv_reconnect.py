@@ -139,8 +139,8 @@ async def test_network_retry_stops_when_disabled(monkeypatch: pytest.MonkeyPatch
 # ---- stalled connect ----
 
 
-async def test_stalled_connect_is_retried_once_without_backoff() -> None:
-    """The first stalled connect is started again at once, later connects use the normal timeout."""
+async def test_stalled_connect_is_retried_without_backoff() -> None:
+    """A stalled connect is started again at once."""
     apple_tv = AppleTv(_device(), asyncio.get_running_loop())
     stall_timeouts: list[float | None] = []
     results = [ConnectResult.NETWORK_UNREACHABLE, ConnectResult.STALLED, ConnectResult.CONNECTED]
@@ -148,7 +148,20 @@ async def test_stalled_connect_is_retried_once_without_backoff() -> None:
     calls = await _run_connect_loop(apple_tv, results, stall_timeouts=stall_timeouts)
 
     assert calls == 3
-    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT, None]
+    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT]
+    apple_tv._backoff.assert_not_called()
+
+
+async def test_stall_restarts_are_limited() -> None:
+    """After CONNECT_STALL_RESTARTS stalls, connects use the normal timeout."""
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    stall_timeouts: list[float | None] = []
+    results = [ConnectResult.STALLED] * tv.CONNECT_STALL_RESTARTS + [ConnectResult.CONNECTED]
+
+    calls = await _run_connect_loop(apple_tv, results, stall_timeouts=stall_timeouts)
+
+    assert calls == tv.CONNECT_STALL_RESTARTS + 1
+    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT] * tv.CONNECT_STALL_RESTARTS + [None]
     apple_tv._backoff.assert_not_called()
 
 

@@ -70,11 +70,13 @@ NETWORK_RETRY_TIMEOUT = 3.0
 CONNECT_TIMEOUT = 15.0
 """Maximum time in seconds to wait for pyatv.connect() to complete, comfortably above pyatv's own protocol timeouts."""
 CONNECT_STALL_TIMEOUT = 0.5
-"""Seconds before the first connect of a connect loop is started again.
+"""Seconds before a connect is started again.
 
 After wake-up, the WiFi link of the remote can go down for a short time during the connect. Lost packets then
 wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.4s.
 """
+CONNECT_STALL_RESTARTS = 2
+"""Maximum number of stalled connects started again in one connect loop."""
 APP_LIST_REFRESH_INTERVAL = 300.0
 OUTPUT_REFRESH_INTERVAL = 300.0
 CONNECT_WAIT_FOR_COMMAND = 3.0
@@ -767,15 +769,15 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
         tries = 0
         network_retries = 0
         network_retry_end: float | None = None
-        # Only one connect per loop is started again after a stall, so a slow network still connects
-        stall_timeout: float | None = CONNECT_STALL_TIMEOUT
+        # Restarts after a stall are limited, so a slow network still connects
+        stall_restarts = CONNECT_STALL_RESTARTS
         while self._is_enabled and self._atv is None and not self._auth_failed:
             tries += 1
-            result = await self._connect_once(stall_timeout)
+            result = await self._connect_once(CONNECT_STALL_TIMEOUT if stall_restarts > 0 else None)
             if result is ConnectResult.CONNECTED:
                 break
             if result is ConnectResult.STALLED:
-                stall_timeout = None
+                stall_restarts -= 1
                 continue
             if result is ConnectResult.NETWORK_UNREACHABLE:
                 now = self._loop.time()
