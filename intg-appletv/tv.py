@@ -53,6 +53,7 @@ from ucapi import StatusCodes
 from ucapi.media_player import Attributes as MediaAttr, MediaContentType, RepeatMode, States as MediaState
 
 from config import AtvDevice, AtvProtocol
+import monkey_patch
 from utils import replace_bad_chars
 
 _LOG = logging.getLogger(__name__)
@@ -70,16 +71,13 @@ NETWORK_RETRY_TIMEOUT = 3.0
 CONNECT_TIMEOUT = 15.0
 """Maximum time in seconds to wait for pyatv.connect() to complete, comfortably above pyatv's own protocol timeouts."""
 CONNECT_STALL_TIMEOUT = 0.5
-"""Seconds before a connect is started again.
+"""Seconds without connect progress before a connect is started again.
 
 After wake-up, the WiFi link of the remote can go down for a short time during the connect. Lost packets then
 wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.4s.
 """
 CONNECT_STALL_RESTARTS = 1
-"""Maximum number of stalled connects started again in one connect loop.
-
-After two stopped connects, the next connect takes about 1s instead of 0.4s.
-"""
+"""Maximum number of stalled connects started again in one connect loop."""
 APP_LIST_REFRESH_INTERVAL = 300.0
 OUTPUT_REFRESH_INTERVAL = 300.0
 CONNECT_WAIT_FOR_COMMAND = 3.0
@@ -900,21 +898,45 @@ class AppleTv(interface.AudioListener, interface.DeviceListener):
         if self._device.name != conf.name:
             self._device.name = conf.name
 
-        # Separate task: if connect finishes at the same time as the timeout, the instance can still be closed
-        connect_task = self._loop.create_task(pyatv.connect(conf, self._loop))
+        self._atv = await self._pyatv_connect(conf, stall_timeout)
+
+    async def _pyatv_connect(
+        self, conf: pyatv.interface.BaseConfig, stall_timeout: float | None
+    ) -> pyatv.interface.AppleTV:
+        """Run pyatv.connect(). Raise ConnectStalledError if there is no progress within stall_timeout."""
+        start = self._loop.time()
+        last_progress = start
+
+        def on_progress() -> None:
+            nonlocal last_progress
+            last_progress = self._loop.time()
+
+        # Separate task: if connect finishes at the same time as the timeout, the instance can still be closed.
+        # The task copies the context, so the protocols report their progress to on_progress.
+        token = monkey_patch.connect_progress.set(on_progress)
         try:
-            await asyncio.wait((connect_task,), timeout=stall_timeout or CONNECT_TIMEOUT)
+            connect_task = self._loop.create_task(pyatv.connect(conf, self._loop))
+        finally:
+            monkey_patch.connect_progress.reset(token)
+        end = start + CONNECT_TIMEOUT
+        try:
+            while not connect_task.done():
+                wait_until = min(end, last_progress + stall_timeout) if stall_timeout else end
+                timeout = wait_until - self._loop.time()
+                if timeout <= 0:
+                    break
+                await asyncio.wait((connect_task,), timeout=timeout)
         except asyncio.CancelledError:
             self._discard_connect_task(connect_task)
             raise
         if not connect_task.done():
             self._discard_connect_task(connect_task)
-            if stall_timeout:
-                msg = f"connect stalled after {stall_timeout}s"
+            if stall_timeout and self._loop.time() < end:
+                msg = f"connect stalled, no progress for {stall_timeout}s"
                 raise ConnectStalledError(msg)
             msg = f"connect timed out after {CONNECT_TIMEOUT}s"
             raise TimeoutError(msg)
-        self._atv = connect_task.result()
+        return connect_task.result()
 
     @staticmethod
     def _discard_connect_task(task: asyncio.Task[pyatv.interface.AppleTV]) -> None:

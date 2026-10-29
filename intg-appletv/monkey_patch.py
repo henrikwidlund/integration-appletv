@@ -9,6 +9,7 @@ This module handles monkey patching of the pyatv library.
 
 import asyncio
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import copy
 import logging
 from random import randint
@@ -53,6 +54,14 @@ HapPairSetupProcedureFactory = Callable[[HttpConnection, SRPAuthHandler, str | N
 _original_facade_add_protocol = FacadeAppleTV.add_protocol
 _original_facade_connect = FacadeAppleTV.connect
 _close_tasks: set[asyncio.Task[Any]] = set()
+
+connect_progress: ContextVar[Callable[[], None] | None] = ContextVar("connect_progress", default=None)
+"""Called when a connect step is done. Set it before the connect task is created."""
+
+
+def _report_progress() -> None:
+    if (callback := connect_progress.get()) is not None:
+        callback()
 
 
 def patched_airplay_hap_pair_setup(
@@ -186,6 +195,7 @@ def patched_facade_add_protocol(self: FacadeAppleTV, setup_data: SetupData) -> N
         except BaseException:
             _keep_close_tasks(close())
             raise
+        _report_progress()
         _LOG.debug("Connected to %s in %.2fs", setup_data.protocol.name, loop.time() - start)
         return result
 
@@ -271,6 +281,7 @@ async def patched_companion_api_connect(self: CompanionAPI) -> None:
     start = loop.time()
     await self._protocol.start()
     verified = loop.time()
+    _report_progress()
 
     await asyncio.gather(
         self.system_info(),
@@ -297,6 +308,7 @@ async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: b
 
     try:
         await self.connection.connect()
+        _report_progress()
 
         self._state = ProtocolState.CONNECTED
 
@@ -308,6 +320,7 @@ async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: b
         self.device_info = await self.send_and_receive(
             messages.device_information(self.info, self.srp.pairing_id.decode())
         )
+        _report_progress()
         # send_and_receive does not send the device information to the listeners
         self.dispatch(protobuf.DEVICE_INFO_MESSAGE, self.device_info)
 
@@ -315,6 +328,7 @@ async def patched_mrp_protocol_start(self: MrpProtocol, skip_initial_messages: b
             return
 
         await error_handler(self._enable_encryption, exceptions.AuthenticationError)
+        _report_progress()
 
         # First message after encryption is enabled
         await self.send(messages.set_connection_state())
@@ -375,6 +389,7 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
         )
         self._channels.append(event_transport)
         event_done = loop.time()
+        _report_progress()
 
         _, data_resp = await asyncio.gather(
             self.rtsp.record(),
@@ -395,6 +410,7 @@ async def patched_ap2_session_setup_remote_control(self: AP2Session) -> None:
             ),
         )
         requested = loop.time()
+        _report_progress()
 
         data_transport, data_channel = await setup_channel(
             DataStreamChannel,

@@ -20,6 +20,7 @@ from ucapi import StatusCodes
 from ucapi.media_player import Attributes as MediaAttr
 
 from config import AtvDevice
+import monkey_patch
 import tv
 from tv import AppleTv, ConnectResult, ConnectStalledError
 
@@ -190,6 +191,46 @@ async def test_connect_raises_stalled_after_stall_timeout(monkeypatch: pytest.Mo
     with pytest.raises(ConnectStalledError):
         await apple_tv._connect(conf, 0.01)
     assert started.is_set()
+    assert apple_tv._atv is None
+
+
+async def test_connect_progress_extends_stall_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connect that reports progress is not stopped, even if it takes longer than the stall timeout."""
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+    atv = MagicMock()
+
+    async def connect(*_args: object) -> MagicMock:
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+            monkey_patch._report_progress()
+        return atv
+
+    monkeypatch.setattr(tv.pyatv, "connect", connect)
+    conf = MagicMock()
+    conf.name = _device().name
+
+    await apple_tv._connect(conf, 0.03)
+    assert apple_tv._atv is atv
+    assert monkey_patch.connect_progress.get() is None
+
+
+async def test_connect_stalls_when_progress_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stall timeout starts again after each progress report."""
+    apple_tv = AppleTv(_device(), asyncio.get_running_loop())
+
+    async def connect(*_args: object) -> None:
+        await asyncio.sleep(0.01)
+        monkey_patch._report_progress()
+        await asyncio.sleep(100)
+
+    monkeypatch.setattr(tv.pyatv, "connect", connect)
+    conf = MagicMock()
+    conf.name = _device().name
+
+    start = time.monotonic()
+    with pytest.raises(ConnectStalledError):
+        await apple_tv._connect(conf, 0.03)
+    assert time.monotonic() - start >= 0.04
     assert apple_tv._atv is None
 
 
