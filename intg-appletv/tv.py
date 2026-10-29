@@ -75,8 +75,11 @@ CONNECT_STALL_TIMEOUT = 0.5
 After wake-up, the WiFi link of the remote can go down for a short time during the connect. Lost packets then
 wait for the TCP retransmit timeout (1s or more). A normal connect takes about 0.4s.
 """
-CONNECT_STALL_RESTARTS = 2
-"""Maximum number of stalled connects started again in one connect loop."""
+CONNECT_STALL_RESTARTS = 1
+"""Maximum number of stalled connects started again in one connect loop.
+
+After two stopped connects, the next connect takes about 1s instead of 0.4s.
+"""
 APP_LIST_REFRESH_INTERVAL = 300.0
 OUTPUT_REFRESH_INTERVAL = 300.0
 CONNECT_WAIT_FOR_COMMAND = 3.0

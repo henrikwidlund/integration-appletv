@@ -148,7 +148,7 @@ async def test_stalled_connect_is_retried_without_backoff() -> None:
     calls = await _run_connect_loop(apple_tv, results, stall_timeouts=stall_timeouts)
 
     assert calls == 3
-    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT]
+    assert stall_timeouts == [tv.CONNECT_STALL_TIMEOUT, tv.CONNECT_STALL_TIMEOUT, None]
     apple_tv._backoff.assert_not_called()
 
 
